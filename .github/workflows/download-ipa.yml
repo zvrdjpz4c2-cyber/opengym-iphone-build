@@ -1,0 +1,38 @@
+name: Make finished OpenGym IPA downloadable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  download:
+    name: Publish the verified IPA download
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Retrieve the successful iPhone build
+        run: |
+          set -euo pipefail
+          test "$(gh run view 38460116025 --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)" = success
+          gh run download 38460116025 --repo "$GITHUB_REPOSITORY" --name OpenGym-iPhone-IPA --dir outputs
+          sha256sum -c outputs/openGym-1.4.1-unsigned.ipa.sha256
+          python3 - <<'PY'
+          import json
+          report=json.load(open('outputs/verification.json'))
+          assert report['sourceCommit']=='464355ef43d4c8f8a4e0bb6db9c2af7f240593b5'
+          assert report['version']=='1.4.1' and report['platform']=='iPhoneOS'
+          assert report['signed'] is False
+          PY
+      - name: Create the direct IPA download
+        run: |
+          set -euo pipefail
+          gh release create opengym-1.4.1 --repo "$GITHUB_REPOSITORY" \
+            --title 'openGym 1.4.1 — unsigned iPhone build' \
+            --notes-file outputs/README.txt \
+            outputs/openGym-1.4.1-unsigned.ipa outputs/openGym-1.4.1-unsigned.ipa.sha256 \
+            outputs/LICENSE outputs/NOTICE.md outputs/README.txt outputs/verification.json
