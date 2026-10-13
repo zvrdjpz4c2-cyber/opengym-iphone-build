@@ -1,0 +1,122 @@
+name: Build OpenGym iPhone IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-tests:
+    name: Check workout and storage logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: DuarteSantos8/openGym
+          ref: 464355ef43d4c8f8a4e0bb6db9c2af7f240593b5
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Run upstream frontend tests
+        working-directory: frontend
+        run: npm test -- --maxWorkers=2
+
+  iphone:
+    name: Compile OpenGym for iPhone
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: DuarteSantos8/openGym
+          ref: 464355ef43d4c8f8a4e0bb6db9c2af7f240593b5
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Show native toolchain
+        run: |
+          xcodebuild -version
+          node --version
+          pod --version
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build complete mobile bundle and native dependencies
+        working-directory: frontend
+        run: npm run build:mobile
+      - name: Archive unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build outputs
+          VER=$(node -p "require('./frontend/package.json').version")
+          BUILD=$(sed -n 's/^ *versionCode \([0-9]*\).*/\1/p' frontend/android/app/build.gradle | head -1)
+          test -n "$BUILD"
+          xcodebuild -workspace frontend/ios/App/App.xcworkspace -scheme App \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/OpenGym.xcarchive" \
+            MARKETING_VERSION="$VER" CURRENT_PROJECT_VERSION="$BUILD" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive > build/iphone-build.log 2>&1 || { tail -120 build/iphone-build.log; exit 1; }
+          tail -25 build/iphone-build.log
+      - name: Verify and package IPA with source notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/OpenGym.xcarchive/Products/Applications/App.app"
+          test -d "$APP"
+          python3 - "$APP" <<'PY'
+          import json, pathlib, plistlib, struct, sys
+          app=pathlib.Path(sys.argv[1])
+          info=plistlib.loads((app/'Info.plist').read_bytes())
+          binary=(app/info['CFBundleExecutable']).read_bytes()
+          assert binary[:4] == bytes.fromhex('cffaedfe'), 'Expected arm64 Mach-O'
+          assert struct.unpack_from('<I',binary,4)[0] == 0x100000c, 'Expected iPhone arm64'
+          assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
+          assert info['CFBundleShortVersionString'] == '1.4.1'
+          assert info['CFBundleIdentifier'] == 'ch.duartesantos.opengym'
+          html=(app/'public/index.html').read_text()
+          assert 'name="opengym-flavor" content="mobile"' in html
+          assert (app/'public/exercise-media').is_dir()
+          report={'version':info['CFBundleShortVersionString'],'build':info['CFBundleVersion'],
+            'bundleId':info['CFBundleIdentifier'],'minimumIOS':info['MinimumOSVersion'],
+            'architecture':'arm64','platform':'iPhoneOS','mobileBundle':True,
+            'sourceCommit':'464355ef43d4c8f8a4e0bb6db9c2af7f240593b5',
+            'signed':False,'phoneRuntimeTested':False}
+          pathlib.Path('outputs/verification.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY
+          mkdir -p build/package/Payload
+          cp -R "$APP" build/package/Payload/
+          (cd build/package && zip -qr ../../outputs/openGym-1.4.1-unsigned.ipa Payload)
+          shasum -a 256 outputs/openGym-1.4.1-unsigned.ipa > outputs/openGym-1.4.1-unsigned.ipa.sha256
+          cp LICENSE NOTICE.md outputs/
+          printf '%s\n' 'Built from https://github.com/DuarteSantos8/openGym/tree/464355ef43d4c8f8a4e0bb6db9c2af7f240593b5' \
+            'No app source modifications. Sign this unsigned IPA with your own account using Sideloadly or AltStore.' \
+            'Choose local/on this phone mode on first launch. This build has not been tested on a physical iPhone.' > outputs/README.txt
+      - name: Downloadable OpenGym IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenGym-iPhone-IPA
+          path: outputs/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Native build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenGym-build-diagnostics
+          path: build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
